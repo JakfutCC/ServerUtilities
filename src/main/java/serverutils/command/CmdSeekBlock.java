@@ -10,12 +10,14 @@ import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.gen.ChunkProviderServer;
 import net.minecraftforge.common.DimensionManager;
 
+import cpw.mods.fml.common.Loader;
 import serverutils.ServerUtilities;
 import serverutils.lib.command.CmdBase;
 
 public class CmdSeekBlock extends CmdBase {
 
     private static final int MAX_RESULTS = 100;
+    private static final boolean CUBIC_CHUNKS_LOADED = Loader.isModLoaded("cubicchunks");
 
     public CmdSeekBlock() {
         super("seek_block", Level.OP);
@@ -107,6 +109,7 @@ public class CmdSeekBlock extends CmdBase {
                         metaWildCard);
 
                 for (Chunk chunkObj : chunkProvider.loadedChunks) {
+                    context.foundCount = foundCount;
                     foundCount += scanChunk(chunkObj, context);
 
                     if (foundCount >= override_max_results) {
@@ -130,6 +133,10 @@ public class CmdSeekBlock extends CmdBase {
     }
 
     private int scanChunk(Chunk chunk, ScanContext context) {
+        if (CUBIC_CHUNKS_LOADED && CubicChunksCompat.isCubic(context.world)) {
+            return CubicChunksCompat.scanLoadedCubes(chunk, context);
+        }
+
         int chunkX = chunk.xPosition * 16;
         int chunkZ = chunk.zPosition * 16;
         int count = 0;
@@ -143,23 +150,7 @@ public class CmdSeekBlock extends CmdBase {
 
                     if (foundBlockID == context.targetBlockID
                             && (context.metaWildCard || foundMeta == context.targetMeta)) {
-                        String message = "Found " + foundBlockID
-                                + ":"
-                                + foundMeta
-                                + " in "
-                                + DimensionManager.getProvider(context.dimId).getDimensionName()
-                                + " (Dim ID: "
-                                + context.dimId
-                                + ") at "
-                                + "("
-                                + x
-                                + ", "
-                                + y
-                                + ", "
-                                + z
-                                + ")";
-                        ServerUtilities.LOGGER.info(message);
-                        context.sender.addChatMessage(new ChatComponentText(EnumChatFormatting.GOLD + message));
+                        reportMatch(foundBlockID, foundMeta, x, y, z, context);
                         count++;
 
                         if (context.foundCount + count >= context.overrideMaxResults) {
@@ -170,6 +161,60 @@ public class CmdSeekBlock extends CmdBase {
             }
         }
         return count;
+    }
+
+    private static void reportMatch(int blockID, int meta, int x, int y, int z, ScanContext context) {
+        String message = "Found " + blockID
+                + ":"
+                + meta
+                + " in "
+                + DimensionManager.getProvider(context.dimId).getDimensionName()
+                + " (Dim ID: "
+                + context.dimId
+                + ") at "
+                + "("
+                + x
+                + ", "
+                + y
+                + ", "
+                + z
+                + ")";
+        ServerUtilities.LOGGER.info(message);
+        context.sender.addChatMessage(new ChatComponentText(EnumChatFormatting.GOLD + message));
+    }
+
+    private static final class CubicChunksCompat {
+
+        private static boolean isCubic(World world) {
+            return world.getChunkProvider() instanceof com.cardinalstar.cubicchunks.world.cube.ICubeProvider;
+        }
+
+        private static int scanLoadedCubes(Chunk chunk, ScanContext context) {
+            int count = 0;
+            int chunkX = chunk.xPosition << 4;
+            int chunkZ = chunk.zPosition << 4;
+            // Column block access can generate cubes. Read the resident cube objects directly instead.
+            for (com.cardinalstar.cubicchunks.world.cube.Cube cube : ((com.cardinalstar.cubicchunks.api.IColumn) chunk)
+                    .getLoadedCubes()) {
+                if (!cube.isCubeLoaded()) continue;
+                int minY = cube.getY() << 4;
+                for (int x = 0; x < 16; x++) {
+                    for (int z = 0; z < 16; z++) {
+                        for (int localY = 0; localY < 16; localY++) {
+                            int y = minY + localY;
+                            int blockID = Block.getIdFromBlock(cube.getBlock(x, y, z));
+                            if (blockID != context.targetBlockID) continue;
+                            int meta = cube.getBlockMetadata(x, y, z);
+                            if (!context.metaWildCard && meta != context.targetMeta) continue;
+                            reportMatch(blockID, meta, chunkX + x, y, chunkZ + z, context);
+                            count++;
+                            if (context.foundCount + count >= context.overrideMaxResults) return count;
+                        }
+                    }
+                }
+            }
+            return count;
+        }
     }
 
     private static class ScanContext {
