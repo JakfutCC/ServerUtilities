@@ -2,6 +2,7 @@
 
 dependencies {
 
+    compileOnly("com.cardinalstar.cubicchunks:CubicChunks1710:v0.1.21-alpha-pre:dev") {transitive = false}
     api("com.github.GTNewHorizons:GTNHLib:0.11.49:dev")
     compileOnly("com.github.GTNewHorizons:NotEnoughItems:2.8.144-GTNH:dev") {transitive = false}
     compileOnly("com.github.GTNewHorizons:EnderIO:2.10.45:dev") {transitive = false}
