@@ -6,10 +6,12 @@ import static serverutils.lib.util.FileUtils.SizeUnit;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -122,7 +124,9 @@ public class BackupTask extends Task {
             saveAndDisableWorldSaving(server.worldServers);
             phase = recordBackupPhase(timings, "world save", phase);
 
-            flushChunkSaves(server.worldServers);
+            CubicBackup cubicBackup = CubicBackup.prepare(server.worldServers);
+            flushChunkSaves(server.worldServers, cubicBackup);
+            if (!backups.use_separate_thread && cubicBackup != null) cubicBackup.flush();
             phase = recordBackupPhase(timings, "chunk flush", phase);
 
             if (!backups.silent_backup) {
@@ -148,7 +152,7 @@ public class BackupTask extends Task {
             universe.scheduleTask(new BackupTask(true));
             if (backups.use_separate_thread) {
                 phase = recordBackupPhase(timings, "setup", phase);
-                ThreadBackup.Snapshot snapshot = ThreadBackup.snapshotFiles(worldDir);
+                ThreadBackup.Snapshot snapshot = ThreadBackup.snapshotFiles(worldDir, cubicBackup);
                 recordBackupPhase(timings, "file snapshot", phase);
                 snapshotPrepared = true;
                 thread = new ThreadBackup(compressor, worldDir, customName, backupChunks, snapshot, onlyClaimed);
@@ -224,11 +228,58 @@ public class BackupTask extends Task {
         }
     }
 
+    /** Captured on the server thread; only the IO barrier runs on the backup worker. */
+    static final class CubicBackup {
+
+        final Class<?> providerClass;
+        final Method flush;
+        final List<Object> providers = new ArrayList<>();
+
+        private CubicBackup(Class<?> providerClass, Method flush, WorldServer[] worlds) {
+            this.providerClass = providerClass;
+            this.flush = flush;
+            for (WorldServer world : worlds) {
+                if (world != null && handles(world)) providers.add(world.getChunkProvider());
+            }
+        }
+
+        static CubicBackup prepare(WorldServer[] worlds) {
+            try {
+                Class<?> provider = Class.forName("com.cardinalstar.cubicchunks.server.CubeProviderServer");
+                return new CubicBackup(provider, provider.getMethod("flushForBackup"), worlds);
+            } catch (ClassNotFoundException | NoSuchMethodException e) {
+                // Older CC ignores save-off, so retain the synchronous snapshot without this capability.
+                return null;
+            }
+        }
+
+        boolean handles(WorldServer world) {
+            return providerClass.isInstance(world.getChunkProvider());
+        }
+
+        void flush() throws IOException {
+            for (Object provider : providers) {
+                try {
+                    flush.invoke(provider);
+                } catch (ReflectiveOperationException e) {
+                    Throwable cause = e instanceof InvocationTargetException ? e.getCause() : e;
+                    if (cause instanceof Error) throw (Error) cause;
+                    if (cause instanceof InterruptedIOException) throw (InterruptedIOException) cause;
+                    throw new IOException("Could not flush CubicChunks storage for backup", cause);
+                }
+            }
+        }
+    }
+
     static void flushChunkSaves(WorldServer[] worlds) throws InterruptedException {
+        flushChunkSaves(worlds, null);
+    }
+
+    private static void flushChunkSaves(WorldServer[] worlds, CubicBackup cubicBackup) throws InterruptedException {
         // Let the worker finish first: concurrent writers can commit older chunk data last.
         ThreadedFileIOBase.threadedIOInstance.waitForFinish();
         for (WorldServer world : worlds) {
-            if (world == null) continue;
+            if (world == null || (cubicBackup != null && cubicBackup.handles(world))) continue;
             boolean suspended = world.levelSaving;
             try {
                 world.levelSaving = false;

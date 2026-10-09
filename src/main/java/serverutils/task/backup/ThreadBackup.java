@@ -19,6 +19,7 @@ import java.nio.file.FileSystems;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.PathMatcher;
 import java.nio.file.Paths;
@@ -102,7 +103,22 @@ public class ThreadBackup extends Thread {
 
     public void run() {
         try {
+            if (snapshot != null && snapshot.cubicBackup != null) {
+                // Saving stays disabled while this worker drains queued writes. Gameplay can continue.
+                if (isInterrupted()) throw new InterruptedIOException("Backup cancelled");
+                snapshot.cubicBackup.flush();
+                if (isInterrupted()) throw new InterruptedIOException("Backup cancelled");
+                refreshCubicStorage(snapshot, src0);
+            }
             doBackup(compressor, src0, customName, chunksToBackup, snapshot, onlyClaimed, dimensionFolders);
+        } catch (InterruptedIOException e) {
+            ServerUtilities.LOGGER.info("Backup cancelled before copying CubicChunks storage");
+        } catch (Exception e) {
+            ServerUtilities.LOGGER.error("Could not prepare CubicChunks backup; no archive was created", e);
+            ServerUtils.notifyChat(
+                    ServerUtils.getServer(),
+                    null,
+                    StringUtils.color("cmd.backup_fail", EnumChatFormatting.RED, e.getMessage()));
         } finally {
             if (snapshot != null) deleteSnapshot();
         }
@@ -272,6 +288,8 @@ public class ThreadBackup extends Thread {
         final Map<String, File> files;
         final File spool;
         final List<ZipEntry> entries = new ArrayList<>();
+        final Set<String> deferredCubicFiles = new HashSet<>();
+        BackupTask.CubicBackup cubicBackup;
 
         Snapshot(Map<String, File> files, File spool) {
             this.files = files;
@@ -280,6 +298,19 @@ public class ThreadBackup extends Thread {
     }
 
     static Snapshot snapshotFiles(File src) throws IOException {
+        return snapshotFiles(src, false);
+    }
+
+    private static Snapshot snapshotFiles(File src, boolean deferCubicStorage) throws IOException {
+        return snapshotFiles(src, deferCubicStorage, null);
+    }
+
+    static Snapshot snapshotFiles(File src, BackupTask.CubicBackup cubicBackup) throws IOException {
+        return snapshotFiles(src, cubicBackup != null, cubicBackup);
+    }
+
+    private static Snapshot snapshotFiles(File src, boolean deferCubicStorage, BackupTask.CubicBackup cubicBackup)
+            throws IOException {
         validateBackupSource(src);
         deleteSnapshot();
         if (!BACKUP_TEMP_FOLDER.mkdirs() && !BACKUP_TEMP_FOLDER.isDirectory()) {
@@ -287,11 +318,28 @@ public class ThreadBackup extends Thread {
         }
 
         Map<File, BasicFileAttributes> listedAttributes = new HashMap<>();
-        Map<String, File> files = listWorldFiles(src, listedAttributes);
+        Map<String, File> files = listWorldFiles(src, listedAttributes, cubicBackup != null);
         Path world = src.toPath().toAbsolutePath().normalize();
         Path realWorld = world.toRealPath();
         Map<Path, Boolean> deferredDirectories = new HashMap<>();
+        if (cubicBackup != null) {
+            // Links can alias live storage. Keep their existing synchronous capture, after draining CC first.
+            for (File file : files.values()) {
+                if (isCubicStoragePath(file.toPath()) && !canDeferCubicStorage(
+                        file,
+                        world,
+                        realWorld,
+                        listedAttributes.get(file),
+                        deferredDirectories)) {
+                    cubicBackup.flush();
+                    listedAttributes.clear();
+                    files = listWorldFiles(src, listedAttributes);
+                    break;
+                }
+            }
+        }
         Snapshot snapshot = new Snapshot(files, new File(BACKUP_TEMP_FOLDER, "snapshot/world-data.bin"));
+        snapshot.cubicBackup = cubicBackup;
         try {
             Files.createDirectories(snapshot.spool.toPath().getParent());
             byte[] buffer = new byte[64 * 1024];
@@ -303,9 +351,12 @@ public class ThreadBackup extends Thread {
                     if (isWorldRegionFile(file, world)) continue;
                     // Reuse the walk's type and timestamp; read the size from the opened file when copying.
                     BasicFileAttributes attributes = listedAttributes.get(file);
-                    if (canDeferWorldData(file, world, realWorld, attributes, deferredDirectories)) {
+                    if (deferCubicStorage
+                            && canDeferCubicStorage(file, world, realWorld, attributes, deferredDirectories)) {
+                        snapshot.deferredCubicFiles.add(entry.getKey());
                         continue;
                     }
+                    if (canDeferWorldData(file, world, realWorld, attributes, deferredDirectories)) continue;
                     if (attributes.isSymbolicLink() || attributes.isOther()) {
                         attributes = Files.readAttributes(file.toPath(), BasicFileAttributes.class);
                     }
@@ -319,6 +370,21 @@ public class ThreadBackup extends Thread {
         } catch (IOException | RuntimeException ex) {
             deleteSnapshot();
             throw ex;
+        }
+    }
+
+    private static void refreshCubicStorage(Snapshot snapshot, File src) throws IOException {
+        // Files may be created, replaced or removed by writes that were pending during the metadata snapshot.
+        snapshot.files.keySet().removeAll(snapshot.deferredCubicFiles);
+        Path world = src.toPath().toAbsolutePath().normalize();
+        Path realWorld = world.toRealPath();
+        Map<Path, Boolean> directories = new HashMap<>();
+        // Ordinary metadata was already captured. Player tmp-file churn during this scan is irrelevant.
+        for (Map.Entry<File, BasicFileAttributes> entry : listOutsideBackupStorage(src, false, true).entrySet()) {
+            File file = entry.getKey();
+            if (canDeferCubicStorage(file, world, realWorld, entry.getValue(), directories)) {
+                snapshot.files.put(FileUtils.getRelativePath(file), file);
+            }
         }
     }
 
@@ -359,8 +425,13 @@ public class ThreadBackup extends Thread {
 
     private static Map<String, File> listWorldFiles(File src, Map<File, BasicFileAttributes> attributes)
             throws IOException {
+        return listWorldFiles(src, attributes, false);
+    }
+
+    private static Map<String, File> listWorldFiles(File src, Map<File, BasicFileAttributes> attributes,
+            boolean writingCubicStorage) throws IOException {
         Map<String, File> files = new LinkedHashMap<>();
-        Map<File, BasicFileAttributes> listed = listOutsideBackupStorage(src);
+        Map<File, BasicFileAttributes> listed = listOutsideBackupStorage(src, writingCubicStorage);
         if (attributes != null) attributes.putAll(listed);
         for (File file : listed.keySet()) {
             files.put(FileUtils.getRelativePath(file), file);
@@ -390,6 +461,16 @@ public class ThreadBackup extends Thread {
      * canonical paths, and this runs on the server thread while world saving is suspended.
      */
     private static Map<File, BasicFileAttributes> listOutsideBackupStorage(File root) throws IOException {
+        return listOutsideBackupStorage(root, false);
+    }
+
+    private static Map<File, BasicFileAttributes> listOutsideBackupStorage(File root, boolean writingCubicStorage)
+            throws IOException {
+        return listOutsideBackupStorage(root, writingCubicStorage, false);
+    }
+
+    private static Map<File, BasicFileAttributes> listOutsideBackupStorage(File root, boolean writingCubicStorage,
+            boolean refreshingCubicStorage) throws IOException {
         Path temp = FileUtils.resolveRealPath(BACKUP_TEMP_FOLDER.toPath());
         Path output = FileUtils.resolveRealPath(BackupTask.BACKUP_FOLDER.toPath());
         Map<File, BasicFileAttributes> files = new LinkedHashMap<>();
@@ -399,6 +480,11 @@ public class ThreadBackup extends Thread {
 
             @Override
             public FileVisitResult visitFileFailed(Path path, IOException failure) throws IOException {
+                // CC may finish a pending atomic replacement before its asynchronous flush completes.
+                if (failure instanceof NoSuchFileException
+                        && (refreshingCubicStorage || (writingCubicStorage && isCubicStoragePath(path)))) {
+                    return FileVisitResult.CONTINUE;
+                }
                 // The walker opens directories before preVisitDirectory, even ones we would exclude.
                 if (isBackupStorage(path.toFile(), temp, output)) return FileVisitResult.CONTINUE;
                 throw failure;
@@ -413,6 +499,11 @@ public class ThreadBackup extends Thread {
             @Override
             public FileVisitResult visitFile(Path path, BasicFileAttributes attributes) throws IOException {
                 File file = path.toFile();
+                if (refreshingCubicStorage) {
+                    // Linked paths retain their original captured contents; only regular CC files are refreshed.
+                    if (attributes.isRegularFile() && isCubicStoragePath(path)) files.put(file, attributes);
+                    return FileVisitResult.CONTINUE;
+                }
                 if (attributes.isSymbolicLink() || attributes.isOther()) {
                     // Keep following ordinary links and excluding backup aliases, without losing link identity.
                     collectOutsideBackupStorage(files, file, temp, output, entry -> true, entry -> true);
@@ -486,6 +577,34 @@ public class ThreadBackup extends Thread {
 
     private static boolean isWorldRegionFile(File file, Path world) {
         return file.getName().endsWith(".mca") && file.toPath().toAbsolutePath().normalize().startsWith(world);
+    }
+
+    private static boolean isCubicStoragePath(Path path) {
+        Path parent = path.getParent();
+        if (parent == null || parent.getFileName() == null) return false;
+        String directory = parent.getFileName().toString();
+        if (directory.equals("region2d") || directory.equals("region3d") || directory.equals("region3d-empty")) {
+            return true;
+        }
+        if (parent.getParent() == null || parent.getParent().getFileName() == null) return false;
+        String outer = parent.getParent().getFileName().toString();
+        return (outer.equals("region2d") && directory.endsWith(".2dr.ext"))
+                || (outer.equals("region3d") && directory.endsWith(".3dr.ext"));
+    }
+
+    private static boolean canDeferCubicStorage(File file, Path world, Path realWorld, BasicFileAttributes attributes,
+            Map<Path, Boolean> directories) throws IOException {
+        if (!attributes.isRegularFile()) return false;
+        Path path = file.toPath().toAbsolutePath().normalize();
+        if (!path.startsWith(world)) return false;
+        Path parent = path.getParent();
+        if (!isCubicStoragePath(path)) return false;
+        Boolean ordinaryDirectory = directories.get(parent);
+        if (ordinaryDirectory == null) {
+            ordinaryDirectory = parent.toRealPath().equals(realWorld.resolve(world.relativize(parent)));
+            directories.put(parent, ordinaryDirectory);
+        }
+        return ordinaryDirectory;
     }
 
     private static boolean canDeferWorldData(File file, Path world, Path realWorld, BasicFileAttributes attributes,
